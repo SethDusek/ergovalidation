@@ -1,13 +1,20 @@
-use std::{ops::Range, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, ops::Range, sync::Arc, time::Duration};
 
 use ergo_lib::{
-    chain::{ergo_state_context::ErgoStateContext, parameters::Parameters, transaction::{Transaction, TxIoVec}}, ergo_chain_types::{BlockId, Header, PreHeader}, ergotree_ir::chain::ergo_box::{BoxId, ErgoBox}, wallet::tx_context::TransactionContext
+    chain::{
+        ergo_state_context::ErgoStateContext,
+        parameters::Parameters,
+        transaction::{Transaction, TxIoVec},
+    },
+    ergo_chain_types::{BlockId, Header, PreHeader},
+    ergotree_ir::chain::ergo_box::{BoxId, ErgoBox},
+    wallet::tx_context::TransactionContext,
 };
 use futures::TryStreamExt;
 use futures::{stream::FuturesOrdered, StreamExt};
 use reqwest::Client;
-use tokio::fs::File;
 use tokio::signal;
+use tokio::{fs::File, task::JoinSet};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
@@ -57,6 +64,17 @@ impl<'s> Node<'s> {
             .json()
             .await?)
     }
+    async fn chain_slice(&self, start: usize, end: usize) -> Result<Vec<Header>, Error> {
+        Ok(self
+            .client
+            .get(format!(
+                "{}/blocks/chainSlice?fromHeight={start}&toHeight={end}", self.node_url
+            ))
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
 
     async fn get_headers(
         &self,
@@ -65,25 +83,10 @@ impl<'s> Node<'s> {
     ) -> Result<Vec<Header>, Error> {
         let mut res = vec![];
         for start in range.step_by(max_simul) {
-            let mut ordered = FuturesOrdered::new();
-            for height in start..start + max_simul {
-                let fut = async move {
-                    let id = self.get_header_id_by_height(start).await.ok()?;
-                    match id {
-                        Some(id) => Some(self.get_header_by_id(id).await),
-                        None => None,
-                    }
-                };
-                ordered.push(fut);
-            }
-            let collected: Vec<Header> = ordered
-                .take_while(|f| std::future::ready(f.is_some()))
-                .map(|f| f.unwrap())
-                .try_collect()
-                .await?;
-            res.extend_from_slice(&collected);
+            let chain_slice = self.chain_slice(start, start + max_simul).await?;
+            res.extend_from_slice(&chain_slice);
             info!("Total headers: {}", res.len());
-            if collected.len() != max_simul {
+            if chain_slice.len() != max_simul {
                 break;
             }
         }
@@ -111,31 +114,38 @@ impl<'s> Node<'s> {
             .await?;
         Ok(res.transactions.transactions)
     }
-    async fn load_tx_context(&self, transaction: Transaction) -> Result<TransactionContext<Transaction>, Error> {
+    async fn load_tx_context(
+        &self,
+        transaction: Transaction,
+    ) -> Result<TransactionContext<Transaction>, Error> {
         let mut inputs = vec![];
         let mut data_inputs = vec![];
-        info!("Starting tx context loading for {}", transaction.id());
         for input in &transaction.inputs {
-            info!("Loading input {}", input.box_id);
             let b = self.get_box_by_id(input.box_id).await?;
             inputs.push(b);
         }
         for data_input in transaction.data_inputs.as_ref().into_iter().flatten() {
-            info!("Loading data input {}", data_input.box_id);
             let b = self.get_box_by_id(data_input.box_id).await?;
             data_inputs.push(b);
         }
-        info!("Loaded tx context");
         Ok(TransactionContext::new(transaction, inputs, data_inputs)?)
     }
 }
 
 // Validate a transaction. Headers should be in reverse order (latest is at index 0)
-async fn validate_transactions<'a>(node: &'a Node<'a>, headers: &[Header], height: usize, transactions: Vec<Transaction>) -> Result<(), Error> {
-    info!("Starting validation of block #{height} id: {}", headers[height].id);
-    let pre_header = PreHeader::from(headers[height].clone());
+async fn validate_transactions<'a>(
+    node: &'a Node<'a>,
+    headers: &[Header],
+    idx: usize,
+    transactions: Vec<Transaction>,
+) -> Result<(), Error> {
+    info!(
+        "{idx} Starting validation of block #{} id: {}",
+        headers[idx].height, headers[idx].id
+    );
+    let pre_header = PreHeader::from(headers[idx].clone());
     // for some reason rustc doesn't believe [Header; 10] implements TryFrom<&[Header]>
-    let mut headers: Vec<Header> = headers[height - 10..height].try_into().unwrap();
+    let mut headers: Vec<Header> = headers[idx - 10..idx].try_into().unwrap();
     headers.reverse();
     let parameters = Parameters::default();
     let state_context = ErgoStateContext::new(pre_header, headers.try_into().unwrap(), parameters);
@@ -144,14 +154,17 @@ async fn validate_transactions<'a>(node: &'a Node<'a>, headers: &[Header], heigh
         let tx_context = node.load_tx_context(transaction).await?;
         let start = std::time::Instant::now();
         match tx_context.validate(&state_context) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => error!("Tx {tx_id} validation failed, reason: {e:?}"),
         }
-        info!("Validated tx {tx_id} in {:?}", std::time::Instant::now() - start);
+        info!(
+            "Validated tx {tx_id} in {:?}",
+            std::time::Instant::now() - start
+        );
     }
     Ok(())
 }
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let appender = tracing_appender::rolling::never("./", "validation.log");
     let (file_writer, _guard) = tracing_appender::non_blocking(appender);
@@ -161,13 +174,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let client = Node {
+    let client = Arc::new(Node {
         node_url: "http://127.0.0.1:9052",
         client: reqwest::Client::builder()
             .http2_keep_alive_interval(Duration::from_secs(1))
             .build()?,
-    };
-    let mut height = match load_block_height().await {
+    });
+    let mut start_height = match load_block_height().await {
         Ok(height) => height,
         Err(e) => match e.kind() {
             tokio::io::ErrorKind::NotFound => {
@@ -178,29 +191,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let mut headers = client.get_headers(1..1_000_000, 100).await?;
-    println!("{}", headers.len());
+    let headers: Arc<[Header]> = client.get_headers(start_height - 11..1_000_000, 256).await?.into();
     //headers.reverse();
 
+    // FIXME
+    let mut missing: BTreeSet<usize> = (start_height..headers.last().unwrap().height as usize).collect();
+    let mut joinset = JoinSet::new();
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
-    tokio::spawn(async move {
-        for block in height.. {
-            let transactions = client.get_block_transactions(headers[block].id).await.unwrap();
-            validate_transactions(&client, &headers, block, transactions).await.unwrap();
-        }
-        ()
-    });
+    let mut iter = start_height..headers.last().unwrap().height as usize;
     loop {
-    tokio::select! {
-        new_height = rx.recv() => match new_height {
-            Some(new_height) => height = std::cmp::max(height, new_height),
-            None => break
-        },
-        _ = signal::ctrl_c() => break
+        tokio::select! {
+            new_height = joinset.join_next(), if joinset.len() != 0 => match new_height {
+                Some(Ok(new_height)) => { missing.remove(&new_height); },
+                Some(Err(e)) => { error!("{e:?}"); break }
+                _ => {}
+            },
+            _ = signal::ctrl_c() => break,
+            _ = futures::future::ready(()), if joinset.len() < 100 && !iter.is_empty() => {
+                let block = if let Some(next) = iter.next() {
+                    next
+                }
+                else {
+                   continue;
+                };
+                let headers = headers.clone();
+                let client = client.clone();
+                joinset.spawn(async move {
+                    let idx = block - headers[0].height as usize;
+                    let transactions = client.get_block_transactions(headers[idx].id).await.unwrap();
+                    validate_transactions(&client, &headers, idx, transactions).await.unwrap();
+                    block
+                });
+            }
+        }
     }
-    }
-    tokio::fs::write("./blockindex", format!("{}", height)).await?;
+    // Find minimum excluded integer in set of blocks
+    //dbg!(&missing);
+    tokio::fs::write(
+        "./blockindex",
+        format!("{}", missing.iter().next().unwrap()),
+    )
+    .await?;
     info!("Exiting");
 
     Ok(())
