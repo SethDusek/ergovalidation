@@ -2,18 +2,16 @@ use std::{collections::BTreeSet, ops::Range, sync::Arc, time::Duration};
 
 use ergo_lib::{
     chain::{
-        ergo_state_context::ErgoStateContext,
-        parameters::Parameters,
-        transaction::{Transaction, TxIoVec},
+        ergo_state_context::ErgoStateContext, parameters::Parameters, transaction::Transaction,
     },
     ergo_chain_types::{BlockId, Header, PreHeader},
     ergotree_ir::chain::ergo_box::{BoxId, ErgoBox},
     wallet::tx_context::TransactionContext,
 };
-use futures::TryStreamExt;
+use futures::{pin_mut, Stream, TryStreamExt};
 use futures::{stream::FuturesOrdered, StreamExt};
 use reqwest::Client;
-use tokio::signal;
+use tokio::{signal, sync::RwLock};
 use tokio::{fs::File, task::JoinSet};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -35,7 +33,18 @@ struct Node<'s> {
 }
 
 impl<'s> Node<'s> {
-    async fn get_header_id_by_height(&self, height: usize) -> Result<Option<BlockId>, Error> {
+    async fn get_block_height(&'s self) -> Result<u32, Error> {
+        Ok(self
+            .client
+            .get(format!("{}/info", self.node_url))
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?["fullHeight"]
+            .as_u64()
+            .unwrap() as u32)
+    }
+    async fn get_header_id_by_height(&'s self, height: usize) -> Result<Option<BlockId>, Error> {
         let block_id: Vec<BlockId> = self
             .client
             .get(format!("{}/blocks/at/{height}", self.node_url))
@@ -68,7 +77,8 @@ impl<'s> Node<'s> {
         Ok(self
             .client
             .get(format!(
-                "{}/blocks/chainSlice?fromHeight={start}&toHeight={end}", self.node_url
+                "{}/blocks/chainSlice?fromHeight={start}&toHeight={end}",
+                self.node_url
             ))
             .send()
             .await?
@@ -90,8 +100,37 @@ impl<'s> Node<'s> {
                 break;
             }
         }
-
         Ok(res)
+    }
+    async fn header_stream<'a>(
+        &'a self,
+        start: usize,
+    ) -> impl Stream<Item = Result<Header, Error>> + 'a {
+        async_stream::stream! {
+            let mut last_yielded = start;
+            'outer: loop {
+                let headers = self.chain_slice(last_yielded, last_yielded + 256).await?;
+                let new_height = headers.last().unwrap().height as usize;
+
+                if new_height == last_yielded {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        let height = self.get_block_height().await?;
+                        if last_yielded != height as usize {
+                            info!("New block at height {height} prev {last_yielded} found.");
+                            continue 'outer;
+                        }
+                    }
+                }
+                for header in headers {
+                    if last_yielded == header.height as usize {
+                        continue;
+                    }
+                    last_yielded = header.height as usize;
+                    yield Ok(header);
+                }
+            }
+        }
     }
     async fn get_block_transactions(&self, header_id: BlockId) -> Result<Vec<Transaction>, Error> {
         // TODO: probably a better way to do this
@@ -140,7 +179,7 @@ async fn validate_transactions<'a>(
     transactions: Vec<Transaction>,
 ) -> Result<(), Error> {
     info!(
-        "{idx} Starting validation of block #{} id: {}",
+        "Starting validation of block #{} id: {}",
         headers[idx].height, headers[idx].id
     );
     let pre_header = PreHeader::from(headers[idx].clone());
@@ -180,7 +219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .http2_keep_alive_interval(Duration::from_secs(1))
             .build()?,
     });
-    let mut start_height = match load_block_height().await {
+    let start_height = match load_block_height().await {
         Ok(height) => height,
         Err(e) => match e.kind() {
             tokio::io::ErrorKind::NotFound => {
@@ -190,26 +229,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => Err(e)?,
         },
     };
+    let header_stream = client.header_stream(979250).await;
+    pin_mut!(header_stream);
 
-    let headers: Arc<[Header]> = client.get_headers(start_height - 11..1_000_000, 256).await?.into();
+    // let headers: Arc<[Header]> = client
+    //     .get_headers(start_height - 11..1_000_000, 256)
+    //     .await?
+    //     .into();
     //headers.reverse();
 
-    // FIXME
-    let mut missing: BTreeSet<usize> = (start_height..headers.last().unwrap().height as usize).collect();
+    let mut missing: BTreeSet<usize> =
+         BTreeSet::new();
     let mut joinset = JoinSet::new();
 
-    let mut iter = start_height..headers.last().unwrap().height as usize;
+    let headers = Arc::new(RwLock::new(vec![]));
+    let mut cursor = None; // Index current block to be validated. Gets updated whenever a new task is spawned
     loop {
         tokio::select! {
-            new_height = joinset.join_next(), if joinset.len() != 0 => match new_height {
-                Some(Ok(new_height)) => { missing.remove(&new_height); },
-                Some(Err(e)) => { error!("{e:?}"); break }
-                _ => {}
+            new_header = header_stream.next() => match new_header {
+                Some(Ok(new_header)) => {
+                    info!("Received header {}", new_header.id);
+                    headers.write().await.push(new_header);
+                    let reader = headers.read().await;
+                    if reader.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
+                        missing.insert(reader.last().unwrap().height as usize);
+                        cursor = cursor.or(Some(reader.len() - 1));
+                    }
+                }
+                Some(Err(e)) => { error!("Header recv error: {e:?}"); break }
+                None => unreachable!()
             },
-            _ = signal::ctrl_c() => break,
-            _ = futures::future::ready(()), if joinset.len() < 100 && !iter.is_empty() => {
-                let block = if let Some(next) = iter.next() {
-                    next
+            Some(res) = joinset.join_next() => match res {
+                Ok(new_height) => { missing.remove(&new_height); info!("Removing from missing"); },
+                Err(e) => { error!("{e:?}"); break },
+            },
+            _ = futures::future::ready(()), if joinset.len() < 100 && !missing.is_empty() => {
+                let header_idx = if let Some(next) = cursor.as_mut() {
+                    if *next == headers.read().await.len() {
+                        continue;
+                    }
+                    let tmp = *next;
+                    *next+=1;
+                    tmp
+
                 }
                 else {
                    continue;
@@ -217,12 +279,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let headers = headers.clone();
                 let client = client.clone();
                 joinset.spawn(async move {
-                    let idx = block - headers[0].height as usize;
-                    let transactions = client.get_block_transactions(headers[idx].id).await.unwrap();
-                    validate_transactions(&client, &headers, idx, transactions).await.unwrap();
-                    block
+                    let headers = headers.read().await;
+                    let transactions = client.get_block_transactions(headers[header_idx].id).await.unwrap();
+                    validate_transactions(&client, &headers, header_idx, transactions).await.unwrap();
+                    header_idx
                 });
-            }
+            },
+            _ = signal::ctrl_c() => break
         }
     }
     // Find minimum excluded integer in set of blocks
