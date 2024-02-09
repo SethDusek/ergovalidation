@@ -8,12 +8,15 @@ use ergo_lib::{
     ergotree_ir::chain::ergo_box::{BoxId, ErgoBox},
     wallet::tx_context::TransactionContext,
 };
-use futures::{pin_mut, Stream, TryStreamExt};
-use futures::{stream::FuturesOrdered, StreamExt};
+use futures::StreamExt;
+use futures::{pin_mut, Stream};
 use reqwest::Client;
-use tokio::{signal, sync::RwLock};
-use tokio::{fs::File, task::JoinSet};
-use tracing::{error, info};
+use tokio::task::JoinSet;
+use tokio::{
+    signal,
+    sync::Semaphore,
+};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 type Error = Box<dyn std::error::Error>;
@@ -111,9 +114,9 @@ impl<'s> Node<'s> {
             'outer: loop {
                 let headers = self.chain_slice(last_yielded, last_yielded + 256).await?;
                 let new_height = headers.last().unwrap().height as usize;
-
                 if new_height == last_yielded {
                     loop {
+                        //warn!("Sleeping");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         let height = self.get_block_height().await?;
                         if last_yielded != height as usize {
@@ -174,18 +177,15 @@ impl<'s> Node<'s> {
 // Validate a transaction. Headers should be in reverse order (latest is at index 0)
 async fn validate_transactions<'a>(
     node: &'a Node<'a>,
-    headers: &[Header],
-    idx: usize,
+    headers: Vec<Header>,
+    header: Header,
     transactions: Vec<Transaction>,
 ) -> Result<(), Error> {
+    let pre_header = PreHeader::from(header.clone());
     info!(
         "Starting validation of block #{} id: {}",
-        headers[idx].height, headers[idx].id
+        pre_header.height, header.id
     );
-    let pre_header = PreHeader::from(headers[idx].clone());
-    // for some reason rustc doesn't believe [Header; 10] implements TryFrom<&[Header]>
-    let mut headers: Vec<Header> = headers[idx - 10..idx].try_into().unwrap();
-    headers.reverse();
     let parameters = Parameters::default();
     let state_context = ErgoStateContext::new(pre_header, headers.try_into().unwrap(), parameters);
     for transaction in transactions {
@@ -203,12 +203,13 @@ async fn validate_transactions<'a>(
     }
     Ok(())
 }
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let appender = tracing_appender::rolling::never("./", "validation.log");
     let (file_writer, _guard) = tracing_appender::non_blocking(appender);
     let filter = tracing_subscriber::filter::LevelFilter::INFO;
     tracing_subscriber::registry()
+        //.with(console_subscriber::spawn())
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
         .with(tracing_subscriber::fmt::layer())
@@ -229,67 +230,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => Err(e)?,
         },
     };
-    let header_stream = client.header_stream(979250).await;
+    let header_stream = client.header_stream(start_height - 10).await;
     pin_mut!(header_stream);
 
-    // let headers: Arc<[Header]> = client
-    //     .get_headers(start_height - 11..1_000_000, 256)
-    //     .await?
-    //     .into();
-    //headers.reverse();
-
-    let mut missing: BTreeSet<usize> =
-         BTreeSet::new();
+    let mut missing: BTreeSet<usize> = BTreeSet::new();
     let mut joinset = JoinSet::new();
 
-    let headers = Arc::new(RwLock::new(vec![]));
-    let mut cursor = None; // Index current block to be validated. Gets updated whenever a new task is spawned
+    let mut headers = vec![];
+    // Limit the amount of tasks to prevent fd exhaustion. TODO: figure out a way to get ergo node to support HTTP/2
+    let semaphore = Arc::new(Semaphore::new(120));
     loop {
         tokio::select! {
+            biased;
+            _ = signal::ctrl_c() => break,
             new_header = header_stream.next() => match new_header {
                 Some(Ok(new_header)) => {
                     info!("Received header {}", new_header.id);
-                    headers.write().await.push(new_header);
-                    let reader = headers.read().await;
-                    if reader.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
-                        missing.insert(reader.last().unwrap().height as usize);
-                        cursor = cursor.or(Some(reader.len() - 1));
+                    headers.push(new_header);
+                    if headers.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
+                        missing.insert(headers.last().unwrap().height as usize);
+
+                        let permit = semaphore.clone().acquire_owned().await; // Acquire permit outside of task. This helps bound memory usage since we won't spawn any tasks until there's another slot available
+
+                        let client = client.clone();
+                        let header_idx = headers.len() - 1;
+                        let header = headers[header_idx].clone();
+                        let headers: Vec<Header> = headers[header_idx - 10..header_idx].iter().cloned().rev().collect();
+                        joinset.spawn(async move {
+                            let _permit = permit;
+                            let transactions = client.get_block_transactions(header.id).await.unwrap();
+                            validate_transactions(&client, headers, header, transactions).await.unwrap();
+                            header_idx
+                        });
                     }
                 }
                 Some(Err(e)) => { error!("Header recv error: {e:?}"); break }
                 None => unreachable!()
             },
             Some(res) = joinset.join_next() => match res {
-                Ok(new_height) => { missing.remove(&new_height); info!("Removing from missing"); },
+                Ok(new_height) => { missing.remove(&new_height); },
                 Err(e) => { error!("{e:?}"); break },
             },
-            _ = futures::future::ready(()), if joinset.len() < 100 && !missing.is_empty() => {
-                let header_idx = if let Some(next) = cursor.as_mut() {
-                    if *next == headers.read().await.len() {
-                        continue;
-                    }
-                    let tmp = *next;
-                    *next+=1;
-                    tmp
-
-                }
-                else {
-                   continue;
-                };
-                let headers = headers.clone();
-                let client = client.clone();
-                joinset.spawn(async move {
-                    let headers = headers.read().await;
-                    let transactions = client.get_block_transactions(headers[header_idx].id).await.unwrap();
-                    validate_transactions(&client, &headers, header_idx, transactions).await.unwrap();
-                    header_idx
-                });
-            },
-            _ = signal::ctrl_c() => break
         }
     }
-    // Find minimum excluded integer in set of blocks
-    //dbg!(&missing);
+    // Find minimum excluded integer in set of blocks and store it to resume validation from
     tokio::fs::write(
         "./blockindex",
         format!("{}", missing.iter().next().unwrap()),
