@@ -1,25 +1,22 @@
-use std::{collections::BTreeSet, ops::Range, sync::Arc, time::Duration};
+mod node;
+use std::{collections::BTreeSet, pin::Pin, sync::Arc};
 
+use clap::{Parser, Subcommand};
 use ergo_lib::{
     chain::{
-        ergo_state_context::ErgoStateContext, parameters::Parameters, transaction::Transaction,
+        ergo_state_context::ErgoStateContext,
+        parameters::Parameters,
+        transaction::{Transaction, TxId},
     },
-    ergo_chain_types::{BlockId, Header, PreHeader},
-    ergotree_ir::chain::ergo_box::{BoxId, ErgoBox},
-    wallet::tx_context::TransactionContext,
+    ergo_chain_types::{Header, PreHeader},
 };
-use futures::StreamExt;
-use futures::{pin_mut, Stream};
-use reqwest::Client;
-use tokio::task::JoinSet;
-use tokio::{
-    signal,
-    sync::Semaphore,
-};
+use futures::{pin_mut, StreamExt};
+use node::{Error, Node};
+use tokio::{fs::OpenOptions, io::{AsyncWriteExt, BufWriter}, sync::Mutex, task::JoinSet};
+use tokio::{signal, sync::Semaphore};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
-
-type Error = Box<dyn std::error::Error>;
 
 async fn load_block_height() -> std::io::Result<usize> {
     let index = String::from_utf8(tokio::fs::read("./blockindex").await?)
@@ -30,156 +27,13 @@ async fn load_block_height() -> std::io::Result<usize> {
     Ok(index)
 }
 
-struct Node<'s> {
-    node_url: &'s str,
-    client: Client,
-}
-
-impl<'s> Node<'s> {
-    async fn get_block_height(&'s self) -> Result<u32, Error> {
-        Ok(self
-            .client
-            .get(format!("{}/info", self.node_url))
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?["fullHeight"]
-            .as_u64()
-            .unwrap() as u32)
-    }
-    async fn get_header_id_by_height(&'s self, height: usize) -> Result<Option<BlockId>, Error> {
-        let block_id: Vec<BlockId> = self
-            .client
-            .get(format!("{}/blocks/at/{height}", self.node_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(block_id.get(0).copied())
-    }
-
-    async fn get_header_by_id(&self, id: BlockId) -> Result<Header, Error> {
-        Ok(self
-            .client
-            .get(format!("{}/blocks/{id}/header", self.node_url))
-            .send()
-            .await?
-            .json()
-            .await?)
-    }
-    async fn get_box_by_id<'a>(&self, box_id: BoxId) -> Result<ErgoBox, Error> {
-        Ok(self
-            .client
-            .get(format!("{}/blockchain/box/byId/{box_id}", self.node_url))
-            .send()
-            .await?
-            .json()
-            .await?)
-    }
-    async fn chain_slice(&self, start: usize, end: usize) -> Result<Vec<Header>, Error> {
-        Ok(self
-            .client
-            .get(format!(
-                "{}/blocks/chainSlice?fromHeight={start}&toHeight={end}",
-                self.node_url
-            ))
-            .send()
-            .await?
-            .json()
-            .await?)
-    }
-
-    async fn get_headers(
-        &self,
-        range: Range<usize>,
-        max_simul: usize,
-    ) -> Result<Vec<Header>, Error> {
-        let mut res = vec![];
-        for start in range.step_by(max_simul) {
-            let chain_slice = self.chain_slice(start, start + max_simul).await?;
-            res.extend_from_slice(&chain_slice);
-            info!("Total headers: {}", res.len());
-            if chain_slice.len() != max_simul {
-                break;
-            }
-        }
-        Ok(res)
-    }
-    async fn header_stream<'a>(
-        &'a self,
-        start: usize,
-    ) -> impl Stream<Item = Result<Header, Error>> + 'a {
-        async_stream::stream! {
-            let mut last_yielded = start;
-            'outer: loop {
-                let headers = self.chain_slice(last_yielded, last_yielded + 256).await?;
-                let new_height = headers.last().unwrap().height as usize;
-                if new_height == last_yielded {
-                    loop {
-                        //warn!("Sleeping");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        let height = self.get_block_height().await?;
-                        if last_yielded != height as usize {
-                            info!("New block at height {height} prev {last_yielded} found.");
-                            continue 'outer;
-                        }
-                    }
-                }
-                for header in headers {
-                    if last_yielded == header.height as usize {
-                        continue;
-                    }
-                    last_yielded = header.height as usize;
-                    yield Ok(header);
-                }
-            }
-        }
-    }
-    async fn get_block_transactions(&self, header_id: BlockId) -> Result<Vec<Transaction>, Error> {
-        // TODO: probably a better way to do this
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct BlockTransactions {
-            transactions: Vec<Transaction>,
-        }
-        #[derive(serde::Serialize, serde::Deserialize)]
-        struct Block {
-            #[serde(rename = "blockTransactions")]
-            transactions: BlockTransactions,
-        }
-
-        let res: Block = self
-            .client
-            .get(format!("{}/blocks/{header_id}", self.node_url))
-            .send()
-            .await?
-            .json()
-            .await?;
-        Ok(res.transactions.transactions)
-    }
-    async fn load_tx_context(
-        &self,
-        transaction: Transaction,
-    ) -> Result<TransactionContext<Transaction>, Error> {
-        let mut inputs = vec![];
-        let mut data_inputs = vec![];
-        for input in &transaction.inputs {
-            let b = self.get_box_by_id(input.box_id).await?;
-            inputs.push(b);
-        }
-        for data_input in transaction.data_inputs.as_ref().into_iter().flatten() {
-            let b = self.get_box_by_id(data_input.box_id).await?;
-            data_inputs.push(b);
-        }
-        Ok(TransactionContext::new(transaction, inputs, data_inputs)?)
-    }
-}
-
-// Validate a transaction. Headers should be in reverse order (latest is at index 0)
-async fn validate_transactions<'a>(
+// Validate a list of transactions. Headers should be in reverse order (latest is at index 0)
+async fn validate_transactions<'a, W: tokio::io::AsyncWriteExt + std::marker::Unpin>(
     node: &'a Node<'a>,
     headers: Vec<Header>,
     header: Header,
     transactions: Vec<Transaction>,
+    failure_logger: Pin<Arc<Mutex<W>>>
 ) -> Result<(), Error> {
     let pre_header = PreHeader::from(header.clone());
     info!(
@@ -190,11 +44,18 @@ async fn validate_transactions<'a>(
     let state_context = ErgoStateContext::new(pre_header, headers.try_into().unwrap(), parameters);
     for transaction in transactions {
         let tx_id = transaction.id();
+        if tx_id.to_string() == "e179f12156061c04d375f599bd8aea7ea5e704fab2d95300efb2d87460d60b83" {
+            warn!("Skipping e179f12156061c04d375f599bd8aea7ea5e704fab2d95300efb2d87460d60b83 due to wacky behavior");
+            continue;
+        }
         let tx_context = node.load_tx_context(transaction).await?;
         let start = std::time::Instant::now();
         match tx_context.validate(&state_context) {
             Ok(()) => {}
-            Err(e) => error!("Tx {tx_id} validation failed, reason: {e:?}"),
+            Err(e) => {
+                error!("Tx {tx_id} validation failed, reason: {e:?}");
+                failure_logger.lock().await.write_all(format!("{tx_id}\n").as_bytes()).await?;
+            },
         }
         info!(
             "Validated tx {tx_id} in {:?}",
@@ -203,8 +64,122 @@ async fn validate_transactions<'a>(
     }
     Ok(())
 }
-#[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+
+async fn validation_loop(
+    cancellation_token: CancellationToken,
+    start_height: usize,
+    client: Arc<Node<'static>>,
+) -> Result<(), Error> {
+    let header_stream = client.header_stream(start_height - 10).await;
+    pin_mut!(header_stream);
+
+    let mut missing: BTreeSet<u32> = BTreeSet::new();
+    let mut joinset = tokio_util::task::JoinMap::new();
+
+    let mut headers: Vec<Header> = vec![];
+    // Limit the amount of tasks to prevent fd exhaustion. TODO: figure out a way to get ergo node to support HTTP/2
+    let semaphore = Arc::new(Semaphore::new(50));
+
+    let file = OpenOptions::new().append(true).write(true).create(true).open("failures.txt").await?;
+    let failure_logger = Arc::pin(Mutex::new(BufWriter::new(file)));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => break,
+            Some((id, res)) = joinset.join_next() => match res {
+                Ok(height) => { missing.remove(&height); },
+                Err(e) => { error!("{e:?}, block id: {id}"); break },
+            },
+            new_header = header_stream.next() => match new_header {
+                Some(Ok(new_header)) => {
+                    info!("Received header {}", new_header.id);
+                    headers.push(new_header);
+                    // Transaction 3a8555a63904527a70b4f1896d4c265dff86152db5837820398c5531db143ac2 in block can't be parsed by sigma-rust
+                    if headers.last().unwrap().id.to_string() == "2ad5af788bfd1b92790eadb42a300ad4fc38aaaba599a43574b1ea45d5d9dee4" {
+                        info!("Skipping block 2ad5af788bfd1b92790eadb42a300ad4fc38aaaba599a43574b1ea45d5d9dee4 due to strange behavior");
+                        continue;
+                    }
+                    if headers.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
+                        missing.insert(headers.last().unwrap().height);
+                        let permit = semaphore.clone().acquire_owned().await; // Acquire permit outside of task. This helps bound memory usage since we won't spawn any tasks until there's another slot available
+                        let failure_logger = failure_logger.clone();
+                        let client = client.clone();
+                        let header_idx = headers.len() - 1;
+                        let header = headers[header_idx].clone();
+                        let headers: Vec<Header> = headers[header_idx - 10..header_idx].iter().cloned().rev().collect();
+                        joinset.spawn(header.id, async move {
+                            let _permit = permit;
+                            let height = header.height;
+                            let transactions = client.get_block_transactions(header.id).await.unwrap();
+                            validate_transactions(&client, headers, header, transactions, failure_logger).await.unwrap();
+                            height
+                        });
+                    }
+                }
+                Some(Err(e)) => { error!("Header recv error: {e:?}"); break }
+                None => unreachable!()
+            },
+
+        }
+    }
+    // Find minimum excluded integer in set of blocks and store it to resume validation from
+    failure_logger.lock().await.flush().await?;
+    let saved_height = missing
+        .iter()
+        .next()
+        .unwrap_or(&headers.last().unwrap().height);
+    info!("Saving index at {saved_height}");
+    tokio::fs::write("./blockindex", format!("{}", saved_height)).await?;
+    Ok(())
+}
+
+async fn validate_transaction<'a, 'b>(node: &'a Node<'a>, tx_id: &'b TxId) -> Result<(), Error> {
+    let (height, tx) = node.load_tx_by_id(tx_id).await?;
+    dbg!(height);
+    let mut headers = node
+        .get_headers(
+            height
+                .checked_sub(11)
+                .expect("Can't validate transactions in first 10 blocks yet")
+                ..height,
+            1,
+        )
+        .await?;
+    headers.iter().for_each(|h| println!("{}", h.height));
+    let pre_header: PreHeader = headers.pop().unwrap().into();
+    dbg!(pre_header.height);
+    let headers: [Header; 10] = headers.try_into().unwrap();
+    let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
+    let tx_context = node.load_tx_context(tx).await?;
+    let start = std::time::Instant::now();
+    match tx_context.validate(&state_context) {
+        Ok(()) => {}
+        Err(e) => error!("Tx {tx_id} validation failed, reason: {e:?}"),
+    }
+    info!(
+        "Validated tx {tx_id} in {:?}",
+        std::time::Instant::now() - start
+    );
+    Ok(())
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Run,
+    ValidateTransaction {
+        id: String
+    },
+}
+
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     let appender = tracing_appender::rolling::never("./", "validation.log");
     let (file_writer, _guard) = tracing_appender::non_blocking(appender);
     let filter = tracing_subscriber::filter::LevelFilter::INFO;
@@ -214,72 +189,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let client = Arc::new(Node {
-        node_url: "http://127.0.0.1:9052",
-        client: reqwest::Client::builder()
-            .http2_keep_alive_interval(Duration::from_secs(1))
-            .build()?,
-    });
-    let start_height = match load_block_height().await {
-        Ok(height) => height,
-        Err(e) => match e.kind() {
-            tokio::io::ErrorKind::NotFound => {
-                info!("TX index not found, starting from 1");
-                11
-            }
-            _ => Err(e)?,
-        },
-    };
-    let header_stream = client.header_stream(start_height - 10).await;
-    pin_mut!(header_stream);
-
-    let mut missing: BTreeSet<usize> = BTreeSet::new();
-    let mut joinset = JoinSet::new();
-
-    let mut headers = vec![];
-    // Limit the amount of tasks to prevent fd exhaustion. TODO: figure out a way to get ergo node to support HTTP/2
-    let semaphore = Arc::new(Semaphore::new(120));
-    loop {
-        tokio::select! {
-            biased;
-            _ = signal::ctrl_c() => break,
-            new_header = header_stream.next() => match new_header {
-                Some(Ok(new_header)) => {
-                    info!("Received header {}", new_header.id);
-                    headers.push(new_header);
-                    if headers.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
-                        missing.insert(headers.last().unwrap().height as usize);
-
-                        let permit = semaphore.clone().acquire_owned().await; // Acquire permit outside of task. This helps bound memory usage since we won't spawn any tasks until there's another slot available
-
-                        let client = client.clone();
-                        let header_idx = headers.len() - 1;
-                        let header = headers[header_idx].clone();
-                        let headers: Vec<Header> = headers[header_idx - 10..header_idx].iter().cloned().rev().collect();
-                        joinset.spawn(async move {
-                            let _permit = permit;
-                            let transactions = client.get_block_transactions(header.id).await.unwrap();
-                            validate_transactions(&client, headers, header, transactions).await.unwrap();
-                            header_idx
-                        });
+    let node = Arc::new(Node::new("http://127.0.0.1:9053"));
+    match args.command {
+        Some(Command::Run) | None => {
+            let start_height = match load_block_height().await {
+                Ok(height) => height,
+                Err(e) => match e.kind() {
+                    tokio::io::ErrorKind::NotFound => {
+                        info!("TX index not found, starting from 1");
+                        11
                     }
-                }
-                Some(Err(e)) => { error!("Header recv error: {e:?}"); break }
-                None => unreachable!()
-            },
-            Some(res) = joinset.join_next() => match res {
-                Ok(new_height) => { missing.remove(&new_height); },
-                Err(e) => { error!("{e:?}"); break },
-            },
+                    _ => Err(e)?,
+                },
+            };
+            let token = CancellationToken::new();
+            let join_handle =
+                tokio::spawn(validation_loop(token.clone(), start_height, node.clone()));
+            signal::ctrl_c().await?;
+            token.cancel();
+            join_handle.await?.unwrap();
+            info!("Exiting");
+        }
+        Some(Command::ValidateTransaction { id }) => {
+            let tx_id = TxId(id.try_into().expect("Failed to parse transaction id"));
+            validate_transaction(&node, &tx_id).await.expect("TX validation failed");
         }
     }
-    // Find minimum excluded integer in set of blocks and store it to resume validation from
-    tokio::fs::write(
-        "./blockindex",
-        format!("{}", missing.iter().next().unwrap()),
-    )
-    .await?;
-    info!("Exiting");
 
     Ok(())
 }
