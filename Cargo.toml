@@ -2,17 +2,24 @@
 name = "ergovalidation"
 version = "0.1.0"
 edition = "2021"
+default-run = "validate"
 
+[[bin]]
+name = "validate"
+path = "bin/validate.rs"
+[[bin]]
+name = "sortlogs"
+path = "bin/sortlogs.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.11.24", features = ["json"] }
+reqwest = { version = "0.12.12", features = ["json"] }
 tokio = { version = "1.36.0", features = ["full", "tracing"] }
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
-#ergo-lib = { path = "../sigma-rust/ergo-lib" } 
-ergo-lib = { git = "https://github.com/SethDusek/sigma-rust.git", branch= "txvalidation" }
+ergo-lib = { path = "../sigma-rust/ergo-lib", features = ["json"] } 
+#ergo-lib = { git = "https://github.com/SethDusek/sigma-rust.git", branch= "txvalidation" }
 serde_json = "1.0.113"
 futures = "0.3.30"
 serde = { version = "1.0.196", features = ["derive"] }
@@ -20,6 +27,14 @@ async-stream = "0.3.5"
 console-subscriber = "0.2.0"
 tokio-util = {version = "0.7.10", features = ["rt"]}
 clap = { version = "4.5.0", features = ["derive"] }
+regex = "1.10.4"
+float-ord = "0.3.2"
+base16 = "0.2.1"
+lru = "0.12.5"
+moka = { version = "0.12.9", features = ["future"] }
+fjall = "2.6.0"
+anyhow = "1.0.95"
 
 [profile.release]
 debug = true
+

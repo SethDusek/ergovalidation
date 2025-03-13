@@ -1,4 +1,3 @@
-mod node;
 use std::{collections::BTreeSet, pin::Pin, sync::Arc};
 
 use clap::{Parser, Subcommand};
@@ -10,9 +9,13 @@ use ergo_lib::{
     },
     ergo_chain_types::{Header, PreHeader},
 };
+use ergovalidation::node::{Error, Node};
 use futures::{pin_mut, StreamExt};
-use node::{Error, Node};
-use tokio::{fs::OpenOptions, io::{AsyncWriteExt, BufWriter}, sync::Mutex, task::JoinSet};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncWriteExt, BufWriter},
+    sync::Mutex,
+};
 use tokio::{signal, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -33,8 +36,9 @@ async fn validate_transactions<'a, W: tokio::io::AsyncWriteExt + std::marker::Un
     headers: Vec<Header>,
     header: Header,
     transactions: Vec<Transaction>,
-    failure_logger: Pin<Arc<Mutex<W>>>
+    failure_logger: Pin<Arc<Mutex<W>>>,
 ) -> Result<(), Error> {
+    use std::sync::atomic::AtomicU64;
     let pre_header = PreHeader::from(header.clone());
     info!(
         "Starting validation of block #{} id: {}",
@@ -42,26 +46,44 @@ async fn validate_transactions<'a, W: tokio::io::AsyncWriteExt + std::marker::Un
     );
     let parameters = Parameters::default();
     let state_context = ErgoStateContext::new(pre_header, headers.try_into().unwrap(), parameters);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let _ = START.set(std::time::Instant::now());
     for transaction in transactions {
         let tx_id = transaction.id();
         if tx_id.to_string() == "e179f12156061c04d375f599bd8aea7ea5e704fab2d95300efb2d87460d60b83" {
             warn!("Skipping e179f12156061c04d375f599bd8aea7ea5e704fab2d95300efb2d87460d60b83 due to wacky behavior");
             continue;
         }
+        let tx_context_time = std::time::Instant::now();
         let tx_context = node.load_tx_context(transaction).await?;
+        info!(
+            "Loaded tx context for {tx_id} in {}μs",
+            tx_context_time.elapsed().as_micros()
+        );
         let start = std::time::Instant::now();
         match tx_context.validate(&state_context) {
             Ok(()) => {}
             Err(e) => {
                 error!("Tx {tx_id} validation failed, reason: {e:?}");
-                failure_logger.lock().await.write_all(format!("{tx_id}\n").as_bytes()).await?;
-            },
+                failure_logger
+                    .lock()
+                    .await
+                    .write_all(format!("{tx_id}\n").as_bytes())
+                    .await?;
+            }
         }
-        info!(
-            "Validated tx {tx_id} in {:?}",
-            std::time::Instant::now() - start
-        );
+        let duration = std::time::Instant::now() - start;
+        info!("Validated tx {tx_id} in {}μs", duration.as_micros());
+        TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    info!(
+        "TPS: {}",
+        TOTAL
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_div(START.get().unwrap().elapsed().as_secs())
+            .unwrap_or(0)
+    );
     Ok(())
 }
 
@@ -78,9 +100,14 @@ async fn validation_loop(
 
     let mut headers: Vec<Header> = vec![];
     // Limit the amount of tasks to prevent fd exhaustion. TODO: figure out a way to get ergo node to support HTTP/2
-    let semaphore = Arc::new(Semaphore::new(50));
+    let semaphore = Arc::new(Semaphore::new(8));
 
-    let file = OpenOptions::new().append(true).write(true).create(true).open("failures.txt").await?;
+    let file = OpenOptions::new()
+        .append(true)
+        .write(true)
+        .create(true)
+        .open("failures.txt")
+        .await?;
     let failure_logger = Arc::pin(Mutex::new(BufWriter::new(file)));
     loop {
         tokio::select! {
@@ -94,11 +121,6 @@ async fn validation_loop(
                 Some(Ok(new_header)) => {
                     info!("Received header {}", new_header.id);
                     headers.push(new_header);
-                    // Transaction 3a8555a63904527a70b4f1896d4c265dff86152db5837820398c5531db143ac2 in block can't be parsed by sigma-rust
-                    if headers.last().unwrap().id.to_string() == "2ad5af788bfd1b92790eadb42a300ad4fc38aaaba599a43574b1ea45d5d9dee4" {
-                        info!("Skipping block 2ad5af788bfd1b92790eadb42a300ad4fc38aaaba599a43574b1ea45d5d9dee4 due to strange behavior");
-                        continue;
-                    }
                     if headers.len() > 10 { // Only validate transactions with 10 blocks preceding them. This is a limitation of sigma-rust atm
                         missing.insert(headers.last().unwrap().height);
                         let permit = semaphore.clone().acquire_owned().await; // Acquire permit outside of task. This helps bound memory usage since we won't spawn any tasks until there's another slot available
@@ -135,19 +157,15 @@ async fn validation_loop(
 
 async fn validate_transaction<'a, 'b>(node: &'a Node<'a>, tx_id: &'b TxId) -> Result<(), Error> {
     let (height, tx) = node.load_tx_by_id(tx_id).await?;
-    dbg!(height);
     let mut headers = node
         .get_headers(
             height
                 .checked_sub(11)
-                .expect("Can't validate transactions in first 10 blocks yet")
-                ..height,
+                .expect("Can't validate transactions in first 10 blocks yet")..height,
             1,
         )
         .await?;
-    headers.iter().for_each(|h| println!("{}", h.height));
     let pre_header: PreHeader = headers.pop().unwrap().into();
-    dbg!(pre_header.height);
     let headers: [Header; 10] = headers.try_into().unwrap();
     let state_context = ErgoStateContext::new(pre_header, headers, Parameters::default());
     let tx_context = node.load_tx_context(tx).await?;
@@ -156,19 +174,15 @@ async fn validate_transaction<'a, 'b>(node: &'a Node<'a>, tx_id: &'b TxId) -> Re
         Ok(()) => {}
         Err(e) => error!("Tx {tx_id} validation failed, reason: {e:?}"),
     }
-    info!(
-        "Validated tx {tx_id} in {:?}",
-        std::time::Instant::now() - start
-    );
+    let duration = std::time::Instant::now() - start;
+    info!("Validated tx {tx_id} in {}us", duration.as_micros());
     Ok(())
 }
 
 #[derive(Subcommand)]
 enum Command {
     Run,
-    ValidateTransaction {
-        id: String
-    },
+    ValidateTransaction { id: String },
 }
 
 #[derive(Parser)]
@@ -176,22 +190,23 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 }
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let appender = tracing_appender::rolling::never("./", "validation.log");
-    let (file_writer, _guard) = tracing_appender::non_blocking(appender);
-    let filter = tracing_subscriber::filter::LevelFilter::INFO;
-    tracing_subscriber::registry()
-        //.with(console_subscriber::spawn())
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-    let node = Arc::new(Node::new("http://127.0.0.1:9053"));
+    let node = Arc::new(Node::new("http://127.0.0.1:9054"));
     match args.command {
         Some(Command::Run) | None => {
+            let appender = tracing_appender::rolling::never("./", "validation.log");
+            let (file_writer, _guard) = tracing_appender::non_blocking(appender);
+            let filter = tracing_subscriber::filter::LevelFilter::INFO;
+            // console_subscriber::init();
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer().with_writer(file_writer))
+                .with(tracing_subscriber::fmt::layer())
+                .init();
             let start_height = match load_block_height().await {
                 Ok(height) => height,
                 Err(e) => match e.kind() {
@@ -211,8 +226,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Exiting");
         }
         Some(Command::ValidateTransaction { id }) => {
+            let filter = tracing_subscriber::filter::LevelFilter::INFO;
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(tracing_subscriber::fmt::layer())
+                .init();
+
             let tx_id = TxId(id.try_into().expect("Failed to parse transaction id"));
-            validate_transaction(&node, &tx_id).await.expect("TX validation failed");
+            validate_transaction(&node, &tx_id)
+                .await
+                .expect("TX validation failed");
         }
     }
 
