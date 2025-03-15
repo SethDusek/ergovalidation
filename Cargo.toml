@@ -34,6 +34,7 @@ lru = "0.12.5"
 moka = { version = "0.12.9", features = ["future"] }
 fjall = "2.6.0"
 anyhow = "1.0.95"
+rocksdb = { version = "0.23.0", features = ["io-uring"] }
 
 [profile.release]
 debug = true

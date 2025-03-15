@@ -10,7 +10,6 @@ use ergo_lib::{
     ergotree_ir::chain::ergo_box::{BoxId, ErgoBox},
     wallet::tx_context::TransactionContext,
 };
-use fjall::PartitionHandle;
 use futures::Stream;
 use moka::policy::EvictionPolicy;
 use reqwest::Client;
@@ -90,18 +89,9 @@ impl<'s> Node<'s> {
         box_ids: impl Iterator<Item = BoxId>,
         delete: bool,
     ) -> Result<Vec<ErgoBox>, Error> {
-        static TOTAL: AtomicUsize = AtomicUsize::new(0);
-        static HITS: AtomicUsize = AtomicUsize::new(0);
-        // info!(
-        //     "Hit rate: {}%",
-        //     (HITS.load(Ordering::Relaxed) as f64 / TOTAL.load(Ordering::Relaxed) as f64) * 100.0,
-        // );
-        // let mut lock = self.block_cache.lock().await;
         let mut boxes = Vec::with_capacity(box_ids.size_hint().0);
         for id in box_ids {
-            TOTAL.fetch_add(1, Ordering::Relaxed);
             if let Some(ergo_box) = self.box_cache.get(&id).await {
-                HITS.fetch_add(1, Ordering::Relaxed);
                 if delete {
                     // inputs that are spent won't be needed again so demote them
                     self.box_cache.invalidate(&id).await;
@@ -120,13 +110,12 @@ impl<'s> Node<'s> {
         Ok(boxes)
     }
 
-    async fn cache(&self, ergo_boxes: impl Iterator<Item = ErgoBox>) -> Result<(), Error> {
+    async fn cache(&self, ergo_boxes: &[ErgoBox]) -> Result<(), Error> {
         let now = std::time::Instant::now();
-        let cache = &self.box_cache;
-        for ergo_box in ergo_boxes {
-            self.box_cache_disk.insert(&ergo_box).await?;
-            cache.insert(ergo_box.box_id(), ergo_box).await;
+        for b in ergo_boxes {
+            self.box_cache.insert(b.box_id(), b.clone()).await;
         }
+        self.box_cache_disk.insert_many(ergo_boxes.iter()).await?;
         println!("Cached in {:?}", now.elapsed());
         Ok(())
     }
@@ -235,8 +224,7 @@ impl<'s> Node<'s> {
                 false,
             )
             .await?;
-        self.cache(transaction.outputs().into_iter().cloned())
-            .await?;
+        self.cache(transaction.outputs()).await?;
         Ok(TransactionContext::new(transaction, inputs, data_inputs)?)
     }
     // Load a transaction by ID and return the block height the transaction was included in
